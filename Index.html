@@ -1,281 +1,236 @@
-<!--
-Index.html
-Client-side waterfall collage UI.
-Behavior:
- - Fetches JSON index from server endpoint /?action=index
- - Renders a CSS-column masonry layout (waterfall)
- - Lazy-loads images with IntersectionObserver
- - Keeps only a sliding window of images in the DOM to limit memory
- - Auto-scrolls the container slowly and loops back to top (continuous waterfall)
--->
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Waterfall Collage</title>
-  <style>
-    :root{
-      --bg:#000;
-      --gap:8px;
-      --col-count:4; /* tune for device width */
-      --scroll-speed:0.25; /* px per frame approx; adjust for smoothness */
-      --max-dom-items:60; /* keep DOM small */
-    }
-    html,body{
-      height:100%;
-      margin:0;
-      background:var(--bg);
-      color:#fff;
-      overflow:hidden;
-      font-family:Arial, Helvetica, sans-serif;
-    }
-    #stage{
-      position:relative;
-      height:100vh;
-      width:100vw;
-      overflow:hidden;
-    }
-    /* Masonry using CSS columns */
-    #masonry{
-      column-count: var(--col-count);
-      column-gap: var(--gap);
-      height:100%;
-      width:100%;
-      padding: var(--gap);
-      box-sizing:border-box;
-      overflow: auto;
-      scroll-behavior: auto;
-    }
-    .item{
-      display:inline-block;
-      width:100%;
-      margin:0 0 var(--gap);
-      break-inside: avoid;
-      background: #111;
-      border-radius:6px;
-      overflow:hidden;
-    }
-    .item img{
-      width:100%;
-      height:auto;
-      display:block;
-      object-fit:cover;
-      background: linear-gradient(90deg,#222,#111);
-    }
-    /* subtle overlay */
-    .meta{
-      position:absolute;
-      left:8px;
-      bottom:8px;
-      padding:6px 8px;
-      background:rgba(0,0,0,0.4);
-      color:#fff;
-      font-size:12px;
-      border-radius:4px;
-      pointer-events:none;
-    }
-    /* Responsive column count */
-    @media (max-width:1200px){ :root{ --col-count:3; } }
-    @media (max-width:800px){ :root{ --col-count:2; } }
-    @media (max-width:480px){ :root{ --col-count:1; } }
-  </style>
+<base target="_top">
+<style>
+  body {
+    background-color: #050505;
+    margin: 0;
+    overflow: hidden;
+    font-family: 'Roboto', sans-serif;
+  }
+
+  #stage {
+    display: flex;
+    width: 100vw;
+    height: 100vh;
+    padding: 0 10px;
+    gap: 15px;
+    box-sizing: border-box;
+  }
+
+  .column {
+    flex: 1;
+    position: relative;
+    will-change: transform; 
+  }
+
+  .photo-card {
+    position: relative;
+    width: 100%;
+    margin-bottom: 15px; 
+    border-radius: 8px;
+    overflow: hidden;
+    background: #151515; 
+    transform: translateZ(0);
+    transition: box-shadow 0.5s ease;
+  }
+
+  /* Limit height so one massive image doesn't block the flow */
+  .photo-card img {
+    width: 100%;
+    max-height: 60vh; 
+    object-fit: cover; 
+    display: block;
+    opacity: 0;
+    transition: opacity 0.5s ease;
+  }
+
+  .photo-card img.loaded { opacity: 1; }
+
+  /* HIGHLIGHT NEW PHOTOS */
+  .photo-card.new-arrival {
+    box-shadow: 0 0 0 4px #fff, 0 0 20px #fff;
+    z-index: 10;
+  }
+
+  /* Status Dashboard */
+  #dashboard {
+    position: fixed;
+    bottom: 20px; right: 20px;
+    background: rgba(0,0,0,0.8);
+    color: #888;
+    padding: 8px 12px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-family: monospace;
+    display: flex; align-items: center; gap: 8px;
+    border: 1px solid #333;
+    z-index: 100;
+  }
+  #dot { width: 8px; height: 8px; background: #555; border-radius: 50%; }
+  #dot.ping { background: #0f0; box-shadow: 0 0 5px #0f0; }
+</style>
 </head>
 <body>
-  <div id="stage" aria-hidden="true">
-    <div id="masonry" tabindex="0"></div>
-    <div class="meta" id="meta">Loading…</div>
-  </div>
 
-  <script>
-    // Configuration
-    const INDEX_URL = '?action=index';
-    const POLL_INTERVAL_MS = 30 * 1000; // poll index every 30s as a fallback
-    const MAX_DOM_ITEMS = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--max-dom-items')) || 60;
-    const SCROLL_SPEED = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--scroll-speed')) || 0.25;
+<div id="dashboard">
+  <div id="dot"></div>
+  <span id="msg">Initializing...</span>
+</div>
 
-    let index = [];
-    let masonry = document.getElementById('masonry');
-    let meta = document.getElementById('meta');
-    let observer;
-    let autoScroll = { y: 0, running: true };
-    let lastRender = performance.now();
+<div id="stage">
+  <div class="column"></div>
+  <div class="column"></div>
+  <div class="column"></div>
+  <div class="column"></div>
+</div>
 
-    // Fetch index JSON
-    function fetchIndex() {
-      return new Promise((resolve, reject) => {
-        google.script.run
-          .withSuccessHandler(data => {
-            console.log("Fetched index via google.script.run:", data);
-            resolve(data);
-          })
-          .withFailureHandler(err => {
-            console.error("Error fetching index:", err);
-            reject(err);
-          })
-          .getIndexData();  // calls the server-side function
-      });
-    }
+<script>
+  // --- TUNING ---
+  const SCROLL_SPEED = 1.5; 
+  const POLL_INTERVAL = 5000;
+  const BUFFER = 20; // Lower = Faster appearance of new photos
 
-    // Build DOM items for a slice of index
-    function createItemElement(item) {
-      const div = document.createElement('div');
-      div.className = 'item';
-      div.dataset.id = item.id;
+  // --- STATE ---
+  let knownIds = new Set();
+  let masterPool = []; // Old photos
+  let priorityQueue = []; // New photos
+  let poolIndex = 0;
+  let isFirstLoad = true;
 
-      const img = document.createElement('img');
-      img.alt = 'Uploaded photo';
-      img.dataset.src = item.thumb || item.url;
-      img.loading = 'lazy';
-      img.style.minHeight = '80px';
-      div.appendChild(img);
+  const columns = Array.from(document.querySelectorAll('.column')).map(el => ({
+    el: el,
+    y: 0
+  }));
 
-      // optional: small overlay with timestamp
-      const ts = document.createElement('div');
-      ts.style.fontSize = '11px';
-      ts.style.color = '#ddd';
-      ts.style.padding = '6px';
-      ts.style.background = 'rgba(0,0,0,0.25)';
-      ts.style.display = 'none'; // hide to save rendering; enable if desired
-      div.appendChild(ts);
+  // --- CORE LOOP ---
+  function init() {
+    fetchData();
+    setInterval(fetchData, POLL_INTERVAL);
+    requestAnimationFrame(tick);
+  }
 
-      return div;
-    }
+  // --- DATA SYNC ---
+  function fetchData() {
+    const dot = document.getElementById('dot');
+    dot.classList.add('ping');
+    setTimeout(() => dot.classList.remove('ping'), 500);
 
-    // Render initial set (but keep DOM small)
-    function renderInitial() {
-      console.log("Rendering initial index of length:", index.length);
-      masonry.innerHTML = '';
-      const toRender = Math.min(index.length, MAX_DOM_ITEMS);
-      for (let i = 0; i < toRender; i++) {
-        const el = createItemElement(index[i]);
-        masonry.appendChild(el);
-      }
-      setupObserver();
-      meta.textContent = `Photos: ${index.length}`;
-    }
+    google.script.run
+      .withSuccessHandler(processImages)
+      .withFailureHandler(e => document.getElementById('msg').innerText = "Error")
+      .getRecentImages(Date.now());
+  }
 
-    // Update DOM when new items appear at front
-    function prependNewItems(newItems) {
-      if (!newItems || newItems.length === 0) return;
-      // Insert at top in order
-      for (let i = newItems.length - 1; i >= 0; i--) {
-        const el = createItemElement(newItems[i]);
-        masonry.insertBefore(el, masonry.firstChild);
-      }
-      // Trim DOM if too many
-      trimDom();
-      meta.textContent = `Photos: ${index.length}`;
-    }
+  function processImages(images) {
+    let newCount = 0;
+    const msg = document.getElementById('msg');
 
-    // Trim DOM to keep memory low
-    function trimDom() {
-      const children = masonry.children;
-      while (children.length > MAX_DOM_ITEMS) {
-        // remove from the end (oldest)
-        masonry.removeChild(children[children.length - 1]);
-      }
-    }
-
-    // IntersectionObserver to lazy-load images
-    function setupObserver() {
-      if (observer) observer.disconnect();
-      observer = new IntersectionObserver((entries) => {
-        entries.forEach(entry => {
-          if (entry.isIntersecting) {
-            const img = entry.target.querySelector('img');
-            if (img && img.dataset.src && !img.src) {
-              img.src = img.dataset.src;
-              // release dataset to save memory
-              delete img.dataset.src;
-            }
-            observer.unobserve(entry.target);
-          }
-        });
-      }, {
-        root: masonry,
-        rootMargin: '400px', // pre-load before visible
-        threshold: 0.01
-      });
-
-      // observe current items
-      const items = masonry.querySelectorAll('.item');
-      items.forEach(it => observer.observe(it));
-    }
-
-    // Auto-scroll loop using requestAnimationFrame
-    function scrollLoop(now) {
-      const dt = now - lastRender;
-      lastRender = now;
-      if (autoScroll.running) {
-        // move scrollTop by small amount proportional to dt
-        const delta = SCROLL_SPEED * (dt / 16.67); // normalize to ~60fps
-        masonry.scrollTop += delta;
-        // if reached bottom, loop back to top smoothly
-        if (masonry.scrollTop + masonry.clientHeight >= masonry.scrollHeight - 2) {
-          masonry.scrollTop = 0;
-        }
-      }
-      // Periodically trim DOM to keep memory low
-      trimDom();
-      requestAnimationFrame(scrollLoop);
-    }
-
-    // Poll index and detect new items
-    async function pollLoop() {
-      const newIndex = await fetchIndex();
-      if (!newIndex) {
-        setTimeout(pollLoop, POLL_INTERVAL_MS);
-        return;
-      }
-      // Compare with current index by id
-      if (index.length === 0) {
-        index = newIndex;
-        renderInitial();
-      } else if (newIndex.length > index.length) {
-        // find new items at front
-        const newItems = [];
-        for (let i = 0; i < newIndex.length; i++) {
-          if (i >= index.length || newIndex[i].id !== index[i].id) {
-            newItems.push(newIndex[i]);
-          } else {
-            break;
-          }
-        }
-        if (newItems.length > 0) {
-          index = newIndex;
-          prependNewItems(newItems);
-          // observe newly added nodes
-          setupObserver();
+    // Process Oldest -> Newest
+    for (let i = images.length - 1; i >= 0; i--) {
+      const img = images[i];
+      if (!knownIds.has(img.id)) {
+        knownIds.add(img.id);
+        
+        // If it's the very first load, populate the pool quietly
+        if (isFirstLoad) {
+          masterPool.push(img);
         } else {
-          // fallback: replace index
-          index = newIndex;
+          // LIVE EVENT: Add to priority queue
+          priorityQueue.push(img);
+          masterPool.push(img); // Also add to pool for later recycling
+          newCount++;
         }
-      } else {
-        // index same or smaller (deleted/rotated)
-        index = newIndex;
       }
-      setTimeout(pollLoop, POLL_INTERVAL_MS);
     }
 
-    // Visibility / focus handling to pause scrolling when not visible
-    document.addEventListener('visibilitychange', () => {
-      autoScroll.running = !document.hidden;
+    if (isFirstLoad && masterPool.length > 0) {
+      isFirstLoad = false;
+      msg.innerText = "Live";
+    }
+
+    if (newCount > 0) {
+      msg.innerText = `New: ${newCount} photo(s)`;
+      msg.style.color = "#fff";
+      setTimeout(() => { msg.innerText = "Live"; msg.style.color = "#888"; }, 4000);
+    }
+  }
+
+  // --- ANIMATION ---
+  function tick() {
+    const stageH = window.innerHeight;
+
+    columns.forEach(col => {
+      // 1. Move
+      col.y -= SCROLL_SPEED;
+      col.el.style.transform = `translate3d(0, ${col.y}px, 0)`;
+
+      // 2. Remove Top (Garbage Collection)
+      if (col.y < -300) { // Optimization check
+        const first = col.el.firstElementChild;
+        if (first) {
+          const h = first.offsetHeight + 15;
+          if (col.y < -h) {
+            first.remove();
+            col.y += h; // Snap back
+            col.el.style.transform = `translate3d(0, ${col.y}px, 0)`;
+          }
+        }
+      }
+
+      // 3. Add Bottom (Just-in-Time)
+      const colHeight = col.el.offsetHeight;
+      const visualBottom = colHeight + col.y;
+      
+      // Only add if the bottom is essentially ON SCREEN
+      // This keeps the "waiting line" empty so new photos fit immediately
+      if (visualBottom < stageH + BUFFER) {
+        appendImage(col);
+      }
     });
 
-    // Start everything
-    (async function init(){
-      index = await fetchIndex() || [];
-      renderInitial();
-      requestAnimationFrame(scrollLoop);
-      setTimeout(pollLoop, 1000);
-      // keyboard controls for debugging
-      window.addEventListener('keydown', (e) => {
-        if (e.key === ' ') autoScroll.running = !autoScroll.running;
-        if (e.key === 'ArrowUp') masonry.scrollTop -= 200;
-        if (e.key === 'ArrowDown') masonry.scrollTop += 200;
-      });
-    })();
-  </script>
+    requestAnimationFrame(tick);
+  }
+
+  function appendImage(colObj) {
+    if (masterPool.length === 0) return;
+
+    let data;
+    let isNew = false;
+
+    // PRIORITY CHECK
+    if (priorityQueue.length > 0) {
+      data = priorityQueue.shift();
+      isNew = true;
+      console.log("Injecting NEW photo:", data.id);
+    } else {
+      // Recycle Old
+      data = masterPool[poolIndex % masterPool.length];
+      poolIndex++;
+    }
+
+    const card = document.createElement('div');
+    card.className = 'photo-card';
+    if (isNew) card.className += ' new-arrival';
+
+    const img = new Image();
+    img.src = data.url;
+    img.loading = "eager"; // Force load
+    
+    img.onload = () => {
+      img.classList.add('loaded');
+      // If new, remove the glow after 5 seconds
+      if (isNew) {
+        setTimeout(() => card.classList.remove('new-arrival'), 5000);
+      }
+    };
+
+    card.appendChild(img);
+    colObj.el.appendChild(card);
+  }
+
+  init();
+</script>
 </body>
 </html>
